@@ -9,12 +9,17 @@
 (define-constant ERR_PAYMENT_OVERDUE (err u8))
 (define-constant ERR_COLLATERAL_LOCKED (err u9))
 (define-constant ERR_INVALID_INTEREST_RATE (err u10))
+(define-constant ERR_EXTENSION_LIMIT_REACHED (err u11))
+(define-constant ERR_GRACE_PERIOD_EXPIRED (err u12))
+(define-constant ERR_INSUFFICIENT_EXTENSION_COLLATERAL (err u13))
 
 (define-data-var loan-id-nonce uint u0)
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-loans-repaid uint u0)
 (define-data-var total-amount-loaned uint u0)
 (define-data-var total-amount-repaid uint u0)
+(define-data-var total-extensions-granted uint u0)
+(define-data-var extension-fee-rate uint u5)
 
 (define-map loans
     { loan-id: uint }
@@ -31,6 +36,9 @@
         is-defaulted: bool,
         collateral-locked: bool,
         last-payment-block: uint,
+        extensions-used: uint,
+        grace-period-end: uint,
+        extension-fee-paid: uint,
     }
 )
 
@@ -125,7 +133,17 @@
 
 (define-read-only (is-loan-overdue (loan-id uint))
     (match (get-loan loan-id)
-        loan-data (ok (and (get is-active loan-data) (> stacks-block-height (get due-block loan-data))))
+        loan-data (let (
+                (is-active (get is-active loan-data))
+                (past-due (> stacks-block-height (get due-block loan-data)))
+                (in-grace (unwrap-panic (is-in-grace-period loan-id)))
+            )
+            (ok (and
+                is-active
+                past-due
+                (not in-grace)
+            ))
+        )
         ERR_LOAN_NOT_FOUND
     )
 )
@@ -137,6 +155,8 @@
         total-amount-loaned: (var-get total-amount-loaned),
         total-amount-repaid: (var-get total-amount-repaid),
         active-loans: (- (var-get total-loans-issued) (var-get total-loans-repaid)),
+        total-extensions-granted: (var-get total-extensions-granted),
+        extension-fee-rate: (var-get extension-fee-rate),
         current-block: stacks-block-height,
     }
 )
@@ -237,6 +257,9 @@
                 is-defaulted: false,
                 collateral-locked: true,
                 last-payment-block: u0,
+                extensions-used: u0,
+                grace-period-end: u0,
+                extension-fee-paid: u0,
             })
 
             (let ((current-loans (get loan-ids (get-borrower-loans sender))))
@@ -250,6 +273,104 @@
             (try! (as-contract (stx-transfer? amount tx-sender sender)))
             (ok loan-id)
         )
+    )
+)
+
+(define-read-only (get-extension-fee (loan-id uint))
+    (match (get-loan loan-id)
+        loan-data (let (
+                (principal (get amount loan-data))
+                (fee-rate (var-get extension-fee-rate))
+            )
+            (ok (/ (* principal fee-rate) u100))
+        )
+        ERR_LOAN_NOT_FOUND
+    )
+)
+
+(define-read-only (is-in-grace-period (loan-id uint))
+    (match (get-loan loan-id)
+        loan-data (let ((grace-end (get grace-period-end loan-data)))
+            (ok (and (> grace-end u0) (<= stacks-block-height grace-end)))
+        )
+        ERR_LOAN_NOT_FOUND
+    )
+)
+
+(define-public (request-loan-extension
+        (loan-id uint)
+        (extension-blocks uint)
+    )
+    (let (
+            (sender tx-sender)
+            (loan-data (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+            (extension-fee (unwrap! (get-extension-fee loan-id) ERR_LOAN_NOT_FOUND))
+            (current-collateral (get total-collateral (get-collateral-balance sender)))
+            (required-collateral (* (get collateral-amount loan-data) u125))
+            (max-extensions u2)
+        )
+        (begin
+            (asserts! (is-eq sender (get borrower loan-data)) ERR_UNAUTHORIZED)
+            (asserts! (get is-active loan-data) ERR_LOAN_NOT_ACTIVE)
+            (asserts! (< (get extensions-used loan-data) max-extensions)
+                ERR_EXTENSION_LIMIT_REACHED
+            )
+            (asserts! (> extension-blocks u0) ERR_INVALID_DURATION)
+            (asserts! (>= (* current-collateral u100) required-collateral)
+                ERR_INSUFFICIENT_EXTENSION_COLLATERAL
+            )
+
+            (try! (stx-transfer? extension-fee sender (as-contract tx-sender)))
+
+            (let (
+                    (new-due-block (+ (get due-block loan-data) extension-blocks))
+                    (grace-period-blocks u1440)
+                    (new-grace-end (+ (get due-block loan-data) grace-period-blocks))
+                )
+                (map-set loans { loan-id: loan-id }
+                    (merge loan-data {
+                        due-block: new-due-block,
+                        extensions-used: (+ (get extensions-used loan-data) u1),
+                        grace-period-end: new-grace-end,
+                        extension-fee-paid: (+ (get extension-fee-paid loan-data) extension-fee),
+                    })
+                )
+
+                (let ((payment-count (default-to { count: u0 }
+                        (map-get? loan-payment-counts { loan-id: loan-id })
+                    )))
+                    (map-set payment-history {
+                        loan-id: loan-id,
+                        payment-id: (get count payment-count),
+                    } {
+                        amount: extension-fee,
+                        block-height: stacks-block-height,
+                        payment-type: "extension-fee",
+                    })
+
+                    (map-set loan-payment-counts { loan-id: loan-id } { count: (+ (get count payment-count) u1) })
+                )
+
+                (var-set total-extensions-granted
+                    (+ (var-get total-extensions-granted) u1)
+                )
+                (ok {
+                    extension-blocks: extension-blocks,
+                    fee-paid: extension-fee,
+                    new-due-block: new-due-block,
+                    extensions-remaining: (- max-extensions (get extensions-used loan-data) u1),
+                })
+            )
+        )
+    )
+)
+
+(define-public (update-extension-fee-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= new-rate u20) ERR_INVALID_INTEREST_RATE)
+        (var-set extension-fee-rate new-rate)
+        (ok new-rate)
     )
 )
 
