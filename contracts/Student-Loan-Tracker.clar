@@ -12,6 +12,8 @@
 (define-constant ERR_EXTENSION_LIMIT_REACHED (err u11))
 (define-constant ERR_GRACE_PERIOD_EXPIRED (err u12))
 (define-constant ERR_INSUFFICIENT_EXTENSION_COLLATERAL (err u13))
+(define-constant ERR_LOAN_NOT_LIQUIDATABLE (err u14))
+(define-constant ERR_LOAN_ALREADY_LIQUIDATED (err u15))
 
 (define-data-var loan-id-nonce uint u0)
 (define-data-var total-loans-issued uint u0)
@@ -20,6 +22,9 @@
 (define-data-var total-amount-repaid uint u0)
 (define-data-var total-extensions-granted uint u0)
 (define-data-var extension-fee-rate uint u5)
+(define-data-var liquidation-threshold-blocks uint u2880)
+(define-data-var liquidation-penalty-rate uint u10)
+(define-data-var total-loans-liquidated uint u0)
 
 (define-map loans
     { loan-id: uint }
@@ -39,6 +44,9 @@
         extensions-used: uint,
         grace-period-end: uint,
         extension-fee-paid: uint,
+        is-liquidated: bool,
+        liquidated-block: uint,
+        liquidation-penalty: uint,
     }
 )
 
@@ -67,6 +75,18 @@
 (define-map loan-payment-counts
     { loan-id: uint }
     { count: uint }
+)
+
+(define-map liquidation-history
+    { loan-id: uint }
+    {
+        liquidator: principal,
+        liquidation-block: uint,
+        total-debt: uint,
+        collateral-seized: uint,
+        collateral-returned: uint,
+        penalty-amount: uint,
+    }
 )
 
 (define-read-only (get-loan (loan-id uint))
@@ -156,9 +176,59 @@
         total-amount-repaid: (var-get total-amount-repaid),
         active-loans: (- (var-get total-loans-issued) (var-get total-loans-repaid)),
         total-extensions-granted: (var-get total-extensions-granted),
+        total-loans-liquidated: (var-get total-loans-liquidated),
         extension-fee-rate: (var-get extension-fee-rate),
+        liquidation-threshold-blocks: (var-get liquidation-threshold-blocks),
+        liquidation-penalty-rate: (var-get liquidation-penalty-rate),
         current-block: stacks-block-height,
     }
+)
+
+(define-read-only (get-liquidation-history (loan-id uint))
+    (map-get? liquidation-history { loan-id: loan-id })
+)
+
+(define-read-only (is-loan-liquidatable (loan-id uint))
+    (match (get-loan loan-id)
+        loan-data (let (
+                (is-active (get is-active loan-data))
+                (is-liquidated (get is-liquidated loan-data))
+                (blocks-overdue (- stacks-block-height (get due-block loan-data)))
+                (threshold (var-get liquidation-threshold-blocks))
+                (in-grace (unwrap-panic (is-in-grace-period loan-id)))
+            )
+            (ok (and
+                is-active
+                (not is-liquidated)
+                (> blocks-overdue threshold)
+                (not in-grace)
+            ))
+        )
+        ERR_LOAN_NOT_FOUND
+    )
+)
+
+(define-read-only (calculate-liquidation-amounts (loan-id uint))
+    (match (get-loan loan-id)
+        loan-data (let (
+                (outstanding (unwrap-panic (get-outstanding-balance loan-id)))
+                (collateral (get collateral-amount loan-data))
+                (penalty-rate (var-get liquidation-penalty-rate))
+                (penalty (/ (* outstanding penalty-rate) u100))
+                (total-debt (+ outstanding penalty))
+                (collateral-seized (if (> collateral total-debt) total-debt collateral))
+                (collateral-returned (if (> collateral total-debt) (- collateral total-debt) u0))
+            )
+            (ok {
+                outstanding-balance: outstanding,
+                penalty-amount: penalty,
+                total-debt: total-debt,
+                collateral-seized: collateral-seized,
+                collateral-returned: collateral-returned,
+            })
+        )
+        ERR_LOAN_NOT_FOUND
+    )
 )
 
 (define-public (deposit-collateral (amount uint))
@@ -260,6 +330,9 @@
                 extensions-used: u0,
                 grace-period-end: u0,
                 extension-fee-paid: u0,
+                is-liquidated: false,
+                liquidated-block: u0,
+                liquidation-penalty: u0,
             })
 
             (let ((current-loans (get loan-ids (get-borrower-loans sender))))
@@ -374,6 +447,20 @@
     )
 )
 
+(define-public (update-liquidation-parameters
+        (threshold-blocks uint)
+        (penalty-rate uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> threshold-blocks u0) ERR_INVALID_DURATION)
+        (asserts! (<= penalty-rate u50) ERR_INVALID_INTEREST_RATE)
+        (var-set liquidation-threshold-blocks threshold-blocks)
+        (var-set liquidation-penalty-rate penalty-rate)
+        (ok { threshold-blocks: threshold-blocks, penalty-rate: penalty-rate })
+    )
+)
+
 (define-public (make-payment
         (loan-id uint)
         (payment-amount uint)
@@ -442,6 +529,76 @@
                     })
                 )
             )
+        )
+    )
+)
+
+(define-public (liquidate-loan (loan-id uint))
+    (let (
+            (liquidator tx-sender)
+            (loan-data (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+            (liquidatable (unwrap! (is-loan-liquidatable loan-id) ERR_LOAN_NOT_FOUND))
+            (amounts (unwrap! (calculate-liquidation-amounts loan-id) ERR_LOAN_NOT_FOUND))
+            (borrower (get borrower loan-data))
+            (current-collateral (get total-collateral (get-collateral-balance borrower)))
+        )
+        (begin
+            (asserts! liquidatable ERR_LOAN_NOT_LIQUIDATABLE)
+            (asserts! (not (get is-liquidated loan-data)) ERR_LOAN_ALREADY_LIQUIDATED)
+            (asserts! (get is-active loan-data) ERR_LOAN_NOT_ACTIVE)
+
+            (map-set loans { loan-id: loan-id }
+                (merge loan-data {
+                    is-active: false,
+                    is-liquidated: true,
+                    liquidated-block: stacks-block-height,
+                    liquidation-penalty: (get penalty-amount amounts),
+                })
+            )
+
+            (map-set liquidation-history { loan-id: loan-id } {
+                liquidator: liquidator,
+                liquidation-block: stacks-block-height,
+                total-debt: (get total-debt amounts),
+                collateral-seized: (get collateral-seized amounts),
+                collateral-returned: (get collateral-returned amounts),
+                penalty-amount: (get penalty-amount amounts),
+            })
+
+            (if (> (get collateral-returned amounts) u0)
+                (begin
+                    (try! (as-contract (stx-transfer? (get collateral-returned amounts) tx-sender borrower)))
+                    (map-set collateral-deposits { borrower: borrower } { total-collateral: (- current-collateral (get collateral-amount loan-data)) })
+                )
+                (map-set collateral-deposits { borrower: borrower } { total-collateral: (- current-collateral (get collateral-amount loan-data)) })
+            )
+
+            (let ((payment-count (default-to { count: u0 }
+                    (map-get? loan-payment-counts { loan-id: loan-id })
+                )))
+                (map-set payment-history {
+                    loan-id: loan-id,
+                    payment-id: (get count payment-count),
+                } {
+                    amount: (get collateral-seized amounts),
+                    block-height: stacks-block-height,
+                    payment-type: "liquidation",
+                })
+
+                (map-set loan-payment-counts { loan-id: loan-id } { count: (+ (get count payment-count) u1) })
+            )
+
+            (var-set total-loans-liquidated
+                (+ (var-get total-loans-liquidated) u1)
+            )
+
+            (ok {
+                loan-id: loan-id,
+                collateral-seized: (get collateral-seized amounts),
+                collateral-returned: (get collateral-returned amounts),
+                penalty-applied: (get penalty-amount amounts),
+                liquidator: liquidator,
+            })
         )
     )
 )
