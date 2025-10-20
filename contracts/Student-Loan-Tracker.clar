@@ -2,7 +2,21 @@
 (define-constant ERR_UNAUTHORIZED (err u1))
 (define-constant ERR_LOAN_NOT_FOUND (err u2))
 (define-constant ERR_INVALID_AMOUNT (err u3))
-(define-constant ERR_LOAN_ALREADY_PAID (err u4))
+(define-constant ERR_LOAN_ALREADY_LIQUIDATED (err u15))
+
+;; ===============================
+;; CREDIT RATING SYSTEM CONSTANTS
+;; ===============================
+(define-constant CREDIT-EXCELLENT u800)
+(define-constant CREDIT-GOOD u650)
+(define-constant CREDIT-FAIR u500)
+(define-constant CREDIT-POOR u0)
+
+;; Credit System Error Constants
+(define-constant ERR-CREDIT-NOT-FOUND (err u301))
+(define-constant ERR-INVALID-CREDIT-SCORE (err u302))
+(define-constant ERR-CREDIT-ALREADY-EXISTS (err u303))
+(define-constant ERR-CREDIT-UNAUTHORIZED (err u304))
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u5))
 (define-constant ERR_LOAN_NOT_ACTIVE (err u6))
 (define-constant ERR_INVALID_DURATION (err u7))
@@ -20,6 +34,35 @@
 (define-data-var total-amount-repaid uint u0)
 (define-data-var total-extensions-granted uint u0)
 (define-data-var extension-fee-rate uint u5)
+
+;; ===============================
+;; CREDIT RATING SYSTEM DATA VARS
+;; ===============================
+(define-data-var credit-record-counter uint u0)
+
+;; Credit Score Data Map
+(define-map credit-scores
+    { borrower: principal }
+    {
+        score: uint,
+        rating: (string-ascii 20),
+        payment-punctuality: uint,
+        completion-rate: uint,
+        default-count: uint,
+        last-updated: uint
+    }
+)
+
+;; Credit History Map
+(define-map credit-history
+    { borrower: principal, record-id: uint }
+    {
+        previous-score: uint,
+        new-score: uint,
+        reason: (string-ascii 100),
+        timestamp: uint
+    }
+)
 
 (define-map loans
     { loan-id: uint }
@@ -480,6 +523,199 @@
             )
 
             (ok loan-id)
+        )
+    )
+)
+
+;; ===============================
+;; CREDIT RATING SYSTEM FUNCTIONS
+;; ===============================
+
+;; Read-only function to get credit rating category based on score
+(define-read-only (get-credit-rating-category (score uint))
+    (if (>= score CREDIT-EXCELLENT)
+        "Excellent"
+        (if (>= score CREDIT-GOOD)
+            "Good"
+            (if (>= score CREDIT-FAIR)
+                "Fair"
+                "Poor"
+            )
+        )
+    )
+)
+
+;; Read-only function to get borrower's credit score
+(define-read-only (get-credit-score (borrower principal))
+    (map-get? credit-scores { borrower: borrower })
+)
+
+;; Read-only function to get credit history for a borrower
+(define-read-only (get-credit-history (borrower principal) (record-id uint))
+    (map-get? credit-history { borrower: borrower, record-id: record-id })
+)
+
+;; Private function to record credit score changes
+(define-private (record-credit-change
+    (borrower principal)
+    (previous-score uint)
+    (new-score uint)
+    (reason (string-ascii 100))
+)
+    (let (
+        (record-id (+ (var-get credit-record-counter) u1))
+    )
+        (begin
+            (map-set credit-history
+                { borrower: borrower, record-id: record-id }
+                {
+                    previous-score: previous-score,
+                    new-score: new-score,
+                    reason: reason,
+                    timestamp: stacks-block-height
+                }
+            )
+            (var-set credit-record-counter record-id)
+            (ok record-id)
+        )
+    )
+)
+
+;; Private function to calculate credit score based on loan performance
+(define-private (calculate-credit-score
+    (borrower principal)
+    (payment-punctuality uint)
+    (completion-rate uint)
+    (default-count uint)
+)
+    (let (
+        (punctuality-weight u40)
+        (completion-weight u35)
+        (default-penalty u25)
+        (punctuality-score (* payment-punctuality punctuality-weight))
+        (completion-score (* completion-rate completion-weight))
+        (default-deduction (* default-count default-penalty))
+        (base-score (+ punctuality-score completion-score))
+        (final-score (if (> base-score default-deduction)
+            (- base-score default-deduction)
+            u0
+        ))
+    )
+        (if (> final-score u1000) u1000 final-score)
+    )
+)
+
+;; Public function to initialize credit score for a new borrower
+(define-public (initialize-credit-score (borrower principal))
+    (let (
+        (existing-score (get-credit-score borrower))
+        (initial-score u600)
+    )
+        (begin
+            (asserts! (is-none existing-score) ERR-CREDIT-ALREADY-EXISTS)
+            (map-set credit-scores
+                { borrower: borrower }
+                {
+                    score: initial-score,
+                    rating: (get-credit-rating-category initial-score),
+                    payment-punctuality: u100,
+                    completion-rate: u0,
+                    default-count: u0,
+                    last-updated: stacks-block-height
+                }
+            )
+            (unwrap-panic (record-credit-change borrower u0 initial-score "Initial credit score assignment"))
+            (ok initial-score)
+        )
+    )
+)
+
+;; Public function to update credit rating based on loan performance
+(define-public (update-credit-rating
+    (borrower principal)
+    (payment-punctuality uint)
+    (completion-rate uint)
+    (default-count uint)
+)
+    (let (
+        (existing-credit (unwrap! (get-credit-score borrower) ERR-CREDIT-NOT-FOUND))
+        (previous-score (get score existing-credit))
+        (new-score (calculate-credit-score borrower payment-punctuality completion-rate default-count))
+        (new-rating (get-credit-rating-category new-score))
+    )
+        (begin
+            (asserts! (<= payment-punctuality u100) ERR-INVALID-CREDIT-SCORE)
+            (asserts! (<= completion-rate u100) ERR-INVALID-CREDIT-SCORE)
+            (map-set credit-scores
+                { borrower: borrower }
+                {
+                    score: new-score,
+                    rating: new-rating,
+                    payment-punctuality: payment-punctuality,
+                    completion-rate: completion-rate,
+                    default-count: default-count,
+                    last-updated: stacks-block-height
+                }
+            )
+            (unwrap-panic (record-credit-change borrower previous-score new-score "Credit score updated based on loan performance"))
+            (ok {
+                previous-score: previous-score,
+                new-score: new-score,
+                rating: new-rating
+            })
+        )
+    )
+)
+
+;; Administrative function to reset credit score
+(define-public (reset-credit-score (borrower principal))
+    (let (
+        (existing-credit (unwrap! (get-credit-score borrower) ERR-CREDIT-NOT-FOUND))
+        (previous-score (get score existing-credit))
+        (reset-score u600)
+    )
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR-CREDIT-UNAUTHORIZED)
+            (map-set credit-scores
+                { borrower: borrower }
+                {
+                    score: reset-score,
+                    rating: (get-credit-rating-category reset-score),
+                    payment-punctuality: u100,
+                    completion-rate: u0,
+                    default-count: u0,
+                    last-updated: stacks-block-height
+                }
+            )
+            (unwrap-panic (record-credit-change borrower previous-score reset-score "Administrative credit score reset"))
+            (ok reset-score)
+        )
+    )
+)
+
+;; Administrative function to manually adjust credit score
+(define-public (adjust-credit-score (borrower principal) (new-score uint) (reason (string-ascii 100)))
+    (let (
+        (existing-credit (unwrap! (get-credit-score borrower) ERR-CREDIT-NOT-FOUND))
+        (previous-score (get score existing-credit))
+    )
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR-CREDIT-UNAUTHORIZED)
+            (asserts! (<= new-score u1000) ERR-INVALID-CREDIT-SCORE)
+            (map-set credit-scores
+                { borrower: borrower }
+                (merge existing-credit {
+                    score: new-score,
+                    rating: (get-credit-rating-category new-score),
+                    last-updated: stacks-block-height
+                })
+            )
+            (unwrap-panic (record-credit-change borrower previous-score new-score reason))
+            (ok {
+                previous-score: previous-score,
+                new-score: new-score,
+                rating: (get-credit-rating-category new-score)
+            })
         )
     )
 )
