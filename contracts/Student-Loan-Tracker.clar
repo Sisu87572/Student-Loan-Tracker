@@ -204,6 +204,62 @@
     }
 )
 
+(define-private (borrower-portfolio-step
+        (loan-id uint)
+        (acc {
+            total-loans: uint,
+            active-loans: uint,
+            defaulted-loans: uint,
+            total-principal: uint,
+            total-outstanding: uint,
+            total-paid: uint
+        })
+    )
+    (match (get-loan loan-id)
+        loan-data (let (
+                (principal (get amount loan-data))
+                (blocks-elapsed (- stacks-block-height (get start-block loan-data)))
+                (interest (calculate-interest principal (get interest-rate loan-data) blocks-elapsed))
+                (total-owed (+ principal interest))
+                (amount-paid (get amount-paid loan-data))
+                (outstanding (if (> total-owed amount-paid) (- total-owed amount-paid) u0))
+                (total-loans (+ (get total-loans acc) u1))
+                (active-loans (+ (get active-loans acc) (if (get is-active loan-data) u1 u0)))
+                (defaulted-loans (+ (get defaulted-loans acc) (if (get is-defaulted loan-data) u1 u0)))
+                (total-principal (+ (get total-principal acc) principal))
+                (total-outstanding (+ (get total-outstanding acc) outstanding))
+                (total-paid (+ (get total-paid acc) amount-paid))
+            )
+            {
+                total-loans: total-loans,
+                active-loans: active-loans,
+                defaulted-loans: defaulted-loans,
+                total-principal: total-principal,
+                total-outstanding: total-outstanding,
+                total-paid: total-paid
+            }
+        )
+        acc
+    )
+)
+
+(define-read-only (get-borrower-portfolio (borrower principal))
+    (let (
+            (loan-data (get-borrower-loans borrower))
+            (loan-ids (get loan-ids loan-data))
+            (initial {
+                total-loans: u0,
+                active-loans: u0,
+                defaulted-loans: u0,
+                total-principal: u0,
+                total-outstanding: u0,
+                total-paid: u0
+            })
+        )
+        (fold borrower-portfolio-step loan-ids initial)
+    )
+)
+
 (define-public (deposit-collateral (amount uint))
     (let (
             (sender tx-sender)
